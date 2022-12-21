@@ -44,23 +44,25 @@ typedef struct Row{
 //global u32 USERNAME_SIZE = size_of_attribute(Row, id);
 //global u32 EMAIL_SIZE = size_of_attribute(Row, id);
 
-global u32 USERNAME_SIZE = 32;
-global u32 EMAIL_SIZE = 255;
-global u32 ROW_SIZE = sizeof(Row) + USERNAME_SIZE + EMAIL_SIZE;
+global u32 USERNAME_MAX_SIZE = 32;
+global u32 EMAIL_MAX_SIZE = 255;
+global u32 ROW_MAX_SIZE = sizeof(Row) + USERNAME_MAX_SIZE + EMAIL_MAX_SIZE;
+global u32 WORD_MAX_SIZE = 1024;
 
 //u32 ID_OFFSET = 0;
 //u32 USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
 //u32 EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
 
-u32 PAGE_SIZE = KB(4);
+u32 PAGE_SIZE = KB(1);
 #define TABLE_MAX_PAGES 100
-//u32 ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
+//u32 ROWS_PER_PAGE = PAGE_SIZE / ROW_MAX_SIZE;
 //u32 TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
 
 typedef struct Statement{
     StatementType type;
     Row row;
+    size_t size;
 } Statement;
 
 typedef struct Table{
@@ -94,11 +96,37 @@ prepare_statement(Arena* arena, String8 input, Statement* statement){
     if(str8_starts_with(input, str8_literal("insert"))){
         statement->type = StatementType_insert;
 
-        statement->row.username.str = push_array(arena, u8, 32);
-        statement->row.email.str = push_array(arena, u8, 255);
-        s32 args = sscanf((char*)input.str, "insert %d %s %s", &(statement->row.id), (char*)statement->row.username.str, (char*)statement->row.email.str);
-        statement->row.username.size = str_length((char*)statement->row.username.str);
-        statement->row.email.size = str_length((char*)statement->row.email.str);
+        ScratchArena scratch = begin_scratch(0);
+        u8* username_str = push_array(scratch.arena, u8, WORD_MAX_SIZE);
+        u8* email_str = push_array(scratch.arena, u8, WORD_MAX_SIZE);
+        s32 args = sscanf((char*)input.str, "insert %d %s %s", &(statement->row.id), (char*)username_str, email_str);
+        u64 username_length = str_length((char*)username_str);
+        u64 email_length = str_length((char*)email_str);
+
+        // NOTE: + 1 on push_array() to account for 0 terminator
+        statement->row.username.str = push_array(arena, u8, username_length + 1);
+        statement->row.email.str = push_array(arena, u8, email_length + 1);
+        memcpy(statement->row.username.str, username_str, username_length);
+        memcpy(statement->row.email.str, email_str, email_length);
+        statement->row.username.size = username_length;
+        statement->row.email.size = email_length;
+        size_t unaligned_size = sizeof(Row) + username_length + email_length + 2;
+        statement->size = AlignUpPow2(unaligned_size, sizeof(Row));
+        end_scratch(scratch);
+
+        //statement->row.username.str = push_array(arena, u8, USERNAME_MAX_SIZE);
+        //statement->row.email.str = push_array(arena, u8, EMAIL_MAX_SIZE);
+        //s32 args = sscanf((char*)input.str, "insert %d %s %s", &(statement->row.id), (char*)statement->row.username.str, (char*)statement->row.email.str);
+        //statement->row.username.size = str_length((char*)statement->row.username.str);
+        //statement->row.email.size = str_length((char*)statement->row.email.str);
+
+        //if(statement->row.username.size > 32){
+        //    statement->row.username.str[32] = '\0';
+        //    statement->row.username.size = 32;
+        //}
+        //if(statement->row.email.size >= 255){
+        //    statement->row.username.str[32] = '\0';
+        //}
 
         if(args < 3){
             return(PrepareResult_syntax_error);
@@ -114,9 +142,10 @@ prepare_statement(Arena* arena, String8 input, Statement* statement){
 }
 
 static Arena*
-get_next_page(Table* table){
+get_next_page(Table* table, Statement* statment){
     Arena* page = table->pages[table->pages_filled];
-    if(page->used + ROW_SIZE >= page->size){
+    //if(page->used + 64 > page->size){
+    if(page->used + statment->size > page->size){
         table->pages_filled++;
         page = table->pages[table->pages_filled];
     }
@@ -126,13 +155,15 @@ get_next_page(Table* table){
 static Row*
 serialize_row(Arena* page, Row row_data){
     Row* result = push_struct(page, Row);
-    result->username.str = push_array(page, u8, 32);
-    result->email.str = push_array(page, u8, 255);
+    // NOTE: + 1 on push_array to account for 0 terminator
+    result->username.str = push_array(page, u8, row_data.username.size + 1);
+    result->email.str = push_array(page, u8, row_data.email.size + 1);
     result->id = row_data.id;
-    memcpy(result->username.str, row_data.username.str, 32);
-    memcpy(result->email.str, row_data.email.str, 255);
     result->username.size = row_data.username.size;
     result->email.size = row_data.email.size;
+
+    memcpy(result->username.str, row_data.username.str, row_data.username.size);
+    memcpy(result->email.str, row_data.email.str, row_data.email.size);
 
     // NOTE: align on size of Row
     page->used = AlignUpPow2(page->used, sizeof(Row));
@@ -159,7 +190,7 @@ execute_insert(Table* table, Statement* statement){
         return(ExecuteResult_table_full);
     }
 
-    Arena* page = get_next_page(table);
+    Arena* page = get_next_page(table, statement);
     Row* row = serialize_row(page, statement->row);
     print("page num: %d - page used: %d - page size: %d\n", table->pages_filled, page->used, page->size);
     return(ExecuteResult_success);
