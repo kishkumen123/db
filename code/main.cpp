@@ -19,6 +19,7 @@ typedef enum PrepareResult{
     PrepareResult_success,
     PrepareResult_unrecognized_statement,
     PrepareResult_syntax_error,
+    PrepareResult_negative_id,
 } PrepareResult;
 
 typedef enum StatementType{
@@ -96,41 +97,34 @@ prepare_statement(Arena* arena, String8 input, Statement* statement){
     if(str8_starts_with(input, str8_literal("insert"))){
         statement->type = StatementType_insert;
 
-        ScratchArena scratch = begin_scratch(0);
-        u8* username_str = push_array(scratch.arena, u8, WORD_MAX_SIZE);
-        u8* email_str = push_array(scratch.arena, u8, WORD_MAX_SIZE);
-        s32 args = sscanf((char*)input.str, "insert %d %s %s", &(statement->row.id), (char*)username_str, email_str);
-        u64 username_length = str_length((char*)username_str);
-        u64 email_length = str_length((char*)email_str);
+        char* keyword = strtok((char*)input.str, " ");
+        char* id_string = strtok(0, " ");
+        char* username = strtok(0, " ");
+        char* email = strtok(0, " ");
+
+        if(id_string == 0 || username == 0 || email == 0){
+            return(PrepareResult_syntax_error);
+        }
+
+        // TODO: Need to check to see if we are larger than the page size here
+        u64 username_length = str_length(username);
+        u64 email_length = str_length(email);
+        statement->row.username.size = username_length;
+        statement->row.email.size = email_length;
+        statement->row.id = atoi(id_string);
+        if(statement->row.id < 0){
+            return(PrepareResult_negative_id);
+        }
 
         // NOTE: + 1 on push_array() to account for 0 terminator
         statement->row.username.str = push_array(arena, u8, username_length + 1);
         statement->row.email.str = push_array(arena, u8, email_length + 1);
-        memcpy(statement->row.username.str, username_str, username_length);
-        memcpy(statement->row.email.str, email_str, email_length);
-        statement->row.username.size = username_length;
-        statement->row.email.size = email_length;
+        memcpy(statement->row.username.str, username, username_length);
+        memcpy(statement->row.email.str, email, email_length);
+
         size_t unaligned_size = sizeof(Row) + username_length + email_length + 2;
         statement->size = AlignUpPow2(unaligned_size, sizeof(Row));
-        end_scratch(scratch);
 
-        //statement->row.username.str = push_array(arena, u8, USERNAME_MAX_SIZE);
-        //statement->row.email.str = push_array(arena, u8, EMAIL_MAX_SIZE);
-        //s32 args = sscanf((char*)input.str, "insert %d %s %s", &(statement->row.id), (char*)statement->row.username.str, (char*)statement->row.email.str);
-        //statement->row.username.size = str_length((char*)statement->row.username.str);
-        //statement->row.email.size = str_length((char*)statement->row.email.str);
-
-        //if(statement->row.username.size > 32){
-        //    statement->row.username.str[32] = '\0';
-        //    statement->row.username.size = 32;
-        //}
-        //if(statement->row.email.size >= 255){
-        //    statement->row.username.str[32] = '\0';
-        //}
-
-        if(args < 3){
-            return(PrepareResult_syntax_error);
-        }
         return(PrepareResult_success);
     }
     if(str8_starts_with(input, str8_literal("select"))){
@@ -261,6 +255,9 @@ s32 main(s32 argc, char** argv){
             } break;
             case PrepareResult_syntax_error:{
                 print("Sysntax error. Could not parse statement.\n");
+            } continue;
+            case PrepareResult_negative_id:{
+                print("ID must be positive.\n");
             } continue;
             case PrepareResult_unrecognized_statement:{
                 print("Unrecognized keyword: '%.*s'\n", (s32)input.size, input.str);
