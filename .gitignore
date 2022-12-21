@@ -2,4 +2,6 @@
 build/
 session.vim
 misc/
+.rspec
+spec/
 

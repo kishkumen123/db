@@ -112,7 +112,8 @@ prepare_statement(Arena* arena, String8 input, Statement* statement){
         statement->row.username.size = username_length;
         statement->row.email.size = email_length;
         statement->row.id = atoi(id_string);
-        if(statement->row.id < 0){
+        if(*id_string == '-'){
+        //if(statement->row.id < 0){
             return(PrepareResult_negative_id);
         }
 
