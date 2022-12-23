@@ -33,11 +33,10 @@ typedef enum ExecuteResult{
 } ExecuteResult;
 
 typedef struct Row{
-    u32 id;
+    s32 id;
     String8 username;
     String8 email;
     size_t arena_used;
-    //size_t arena_prev_used;
 } Row;
 
 #define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
@@ -54,10 +53,10 @@ global u32 WORD_MAX_SIZE = 1024;
 //u32 USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
 //u32 EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
 
-u32 PAGE_SIZE = KB(1);
-#define TABLE_MAX_PAGES 100
+u32 PAGE_SIZE = KB(4);
+#define TABLE_PAGES_MAX 100
 //u32 ROWS_PER_PAGE = PAGE_SIZE / ROW_MAX_SIZE;
-//u32 TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
+//u32 TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_PAGES_MAX;
 
 
 typedef struct Statement{
@@ -68,20 +67,17 @@ typedef struct Statement{
 
 typedef struct Table{
     u32 pages_filled;
-    Arena* pages[TABLE_MAX_PAGES];
-
+    Arena* pages[TABLE_PAGES_MAX];
 } Table;
 
 static void
 init_table(Table* table){
-    for(u32 i=0; i < TABLE_MAX_PAGES; ++i){
+    for(u32 i=0; i < TABLE_PAGES_MAX; ++i){
         table->pages[i] = os_allocate_arena(PAGE_SIZE);
     }
     table->pages_filled = 0;
 }
 
-// TODO: fgets() adds \n character. String8 needs to be stronger to handle this.
-// study Allens Websters string stuff
 static MetaCommand
 do_meta_command(String8 input){
     if(input == str8_literal(".exit")){
@@ -93,41 +89,53 @@ do_meta_command(String8 input){
 }
 
 static PrepareResult
-prepare_statement(Arena* arena, String8 input, Statement* statement){
-    if(str8_starts_with(input, str8_literal("insert"))){
-        statement->type = StatementType_insert;
+prepare_insert(Arena* arena, String8 input, Statement* statement){
+    statement->type = StatementType_insert;
 
-        char* keyword = strtok((char*)input.str, " ");
-        char* id_string = strtok(0, " ");
-        char* username = strtok(0, " ");
-        char* email = strtok(0, " ");
+    char* keyword = strtok((char*)input.str, " ");
+    char* id_string = strtok(0, " ");
+    char* username = strtok(0, " ");
+    char* email = strtok(0, " ");
 
-        if(id_string == 0 || username == 0 || email == 0){
-            return(PrepareResult_syntax_error);
-        }
-
-        // TODO: Need to check to see if we are larger than the page size here
-        u64 username_length = str_length(username);
-        u64 email_length = str_length(email);
-        statement->row.username.size = username_length;
-        statement->row.email.size = email_length;
-        statement->row.id = atoi(id_string);
-        if(*id_string == '-'){
-        //if(statement->row.id < 0){
-            return(PrepareResult_negative_id);
-        }
-
-        // NOTE: + 1 on push_array() to account for 0 terminator
-        statement->row.username.str = push_array(arena, u8, username_length + 1);
-        statement->row.email.str = push_array(arena, u8, email_length + 1);
-        memcpy(statement->row.username.str, username, username_length);
-        memcpy(statement->row.email.str, email, email_length);
-
-        size_t unaligned_size = sizeof(Row) + username_length + email_length + 2;
-        statement->size = AlignUpPow2(unaligned_size, sizeof(Row));
-
-        return(PrepareResult_success);
+    if(id_string == 0 || username == 0 || email == 0){
+        return(PrepareResult_syntax_error);
     }
+
+    // TODO: Need to check to see if we are larger than the page size here
+    u64 username_length = str_length(username);
+    u64 email_length = str_length(email);
+    statement->row.id = atoi(id_string); // NOTE: strtol is more flexible. consider using it later
+    if(statement->row.id < 0){
+        return(PrepareResult_negative_id);
+    }
+
+    // NOTE: + 1 on push_array() to account for 0 terminator
+    u8* username_alloc = push_array(arena, u8, username_length + 1);
+    u8* email_alloc = push_array(arena, u8, email_length + 1);
+    statement->row.username = {username_alloc, username_length};
+    statement->row.email = {email_alloc, email_length};
+    u8* username_null_char = statement->row.username.str + username_length;
+    u8* email_null_char = statement->row.email.str + email_length;
+    *username_null_char = 9;
+    *email_null_char = 9;
+
+    memcpy(statement->row.username.str, username, username_length);
+    memcpy(statement->row.email.str, email, email_length);
+
+    size_t unaligned_size = sizeof(Row) + username_length + email_length + 2;
+    statement->size = AlignUpPow2(unaligned_size, sizeof(Row));
+
+    return(PrepareResult_success);
+}
+
+static PrepareResult
+prepare_statement(Arena* arena, String8 input, Statement* statement){
+    PrepareResult result = ZERO_INIT;
+    if(str8_starts_with(input, str8_literal("insert"))){
+        result = prepare_insert(arena, input, statement);
+        return(result);
+    }
+
     if(str8_starts_with(input, str8_literal("select"))){
         statement->type = StatementType_select;
         return(PrepareResult_success);
@@ -137,25 +145,25 @@ prepare_statement(Arena* arena, String8 input, Statement* statement){
 }
 
 static Arena*
-get_next_page(Table* table, Statement* statment){
+get_next_page(Table* table, Statement* statement){
     Arena* page = table->pages[table->pages_filled];
-    //if(page->used + 64 > page->size){
-    if(page->used + statment->size > page->size){
+
+    if(page->used + statement->size > page->size){
         table->pages_filled++;
         page = table->pages[table->pages_filled];
     }
     return(page);
 }
 
-static Row*
-serialize_row(Arena* page, Row row_data){
+static Row* serialize_row(Arena* page, Row row_data){
     Row* result = push_struct(page, Row);
-    // NOTE: + 1 on push_array to account for 0 terminator
-    result->username.str = push_array(page, u8, row_data.username.size + 1);
-    result->email.str = push_array(page, u8, row_data.email.size + 1);
     result->id = row_data.id;
-    result->username.size = row_data.username.size;
-    result->email.size = row_data.email.size;
+
+    // NOTE: + 1 on push_array to account for 0 terminator
+    u8* username = push_array(page, u8, row_data.username.size + 1);
+    u8* email = push_array(page, u8, row_data.email.size + 1);
+    result->username = {username, row_data.username.size};
+    result->email = {email, row_data.email.size};
 
     memcpy(result->username.str, row_data.username.str, row_data.username.size);
     memcpy(result->email.str, row_data.email.str, row_data.email.size);
@@ -181,7 +189,7 @@ static void deserialize_row(Arena* page){
 
 static ExecuteResult
 execute_insert(Table* table, Statement* statement){
-    if(table->pages_filled >= TABLE_MAX_PAGES){
+    if(table->pages_filled >= TABLE_PAGES_MAX){
         return(ExecuteResult_table_full);
     }
 
@@ -221,16 +229,49 @@ str8_strip_newline(String8* str){
     str->size -= 1;
 }
 
+static void
+db_close(Arena* arena, String8 dir, String8 file_name, Table* table){
+    u64 offset = 0;
+    for(u32 i=0; i <= table->pages_filled; ++i){
+        Arena* page = table->pages[i];
+        FileData data = {page->base, page->used};
+        os_file_write(data, dir, file_name, offset);
+        offset += page->size;
+    }
+}
+
 s32 main(s32 argc, char** argv){
-    Arena* string_arena = allocate_arena(MB(1));
-    //Arena* keyword_arena = allocate_arena(MB(1));
+    Arena* pm = allocate_arena(MB(4));
+    Arena* tm = allocate_arena(MB(1));
     Table table;
     init_table(&table);
+
+    String8 dir = os_get_cwd(pm);
+    String8 file_name = str8_literal("\\data\\mydb.db");
+    FileData file = os_file_read(pm, dir, file_name);
+    table.pages_filled = file.size / PAGE_SIZE;
+
+    for(u32 i=0; i <= table.pages_filled; ++i){
+        Arena* page = table.pages[i];
+        page->base = (u8*)file.base + (i * PAGE_SIZE);
+    }
+
+    //void* at = (u8*)file.base;
+    //void* end = (u8*)file.base + file.size;
+    //Row* row;
+    //while(at != end){
+    //    row = (Row*)at;
+    //    at = (u8*)file.base + row->arena_used;
+    //}
+    //u32 num_pages = file.size / PAGE_SIZE;
+
+    //u32 page_number_at = file.size / PAGE_SIZE;
+    //u32 page_number_at = file.size / PAGE_SIZE;
 
     bool running = true;
     while(running){
         print("db > ");
-        String8 input = read_stdin(string_arena);
+        String8 input = read_stdin(tm);
         str8_strip_newline(&input);
 
         if(input.str[0] == '.'){
@@ -238,6 +279,7 @@ s32 main(s32 argc, char** argv){
             switch(command){
                 case MetaCommand_exit:{
                     print("quiting");
+                    db_close(pm, dir, file_name, &table);
                     running = false;
                     exit(EXIT_SUCCESS);
                 } continue;
@@ -250,7 +292,7 @@ s32 main(s32 argc, char** argv){
         }
 
         Statement statement;
-        PrepareResult prepare_result = prepare_statement(string_arena, input, &statement);
+        PrepareResult prepare_result = prepare_statement(tm, input, &statement);
         switch(prepare_result){
             case PrepareResult_success:{
             } break;
@@ -274,7 +316,7 @@ s32 main(s32 argc, char** argv){
                 print("Error: Table full.\n");
             } break;
         }
-        arena_free(string_arena);
+        arena_free(tm);
     }
     return(0);
 }
