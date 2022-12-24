@@ -3,6 +3,11 @@
 #include "base_inc.h"
 #include "win32_base_inc.h"
 
+global Arena* pm = alloc_arena(MB(4));
+global Arena* tm = alloc_arena(MB(1));
+global String8 dir = os_get_cwd(pm);
+global String8 filename = str8_literal("\\data\\mydb.db");
+
 typedef struct InputBuffer{
     char* buffer;
     size_t buffer_length;
@@ -20,6 +25,8 @@ typedef enum PrepareResult{
     PrepareResult_unrecognized_statement,
     PrepareResult_syntax_error,
     PrepareResult_negative_id,
+    PrepareResult_username_too_long,
+    PrepareResult_email_too_long,
 } PrepareResult;
 
 typedef enum StatementType{
@@ -32,50 +39,72 @@ typedef enum ExecuteResult{
     ExecuteResult_table_full,
 } ExecuteResult;
 
+global u32 ID_SIZE = sizeof(s32);
+global u32 const USERNAME_SIZE = 32;
+global u32 const EMAIL_SIZE = 255;
+
 typedef struct Row{
     s32 id;
-    String8 username;
-    String8 email;
-    size_t arena_used;
+    char username[USERNAME_SIZE];
+    char email[EMAIL_SIZE];
 } Row;
 
-#define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
-//global u32 ID_SIZE = size_of_attribute(Row, id);
-//global u32 USERNAME_SIZE = size_of_attribute(Row, id);
-//global u32 EMAIL_SIZE = size_of_attribute(Row, id);
-
-global u32 USERNAME_MAX_SIZE = 32;
-global u32 EMAIL_MAX_SIZE = 255;
-global u32 ROW_MAX_SIZE = sizeof(Row) + USERNAME_MAX_SIZE + EMAIL_MAX_SIZE;
-global u32 WORD_MAX_SIZE = 1024;
-
-//u32 ID_OFFSET = 0;
-//u32 USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
-//u32 EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
-
-u32 PAGE_SIZE = KB(4);
-#define TABLE_PAGES_MAX 100
-//u32 ROWS_PER_PAGE = PAGE_SIZE / ROW_MAX_SIZE;
-//u32 TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_PAGES_MAX;
+global u32 ROW_SIZE = sizeof(Row);
+global u32 PAGE_SIZE = KB(1);
+global u32 ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
+global u32 const TABLE_PAGES = 100;
+global u32 TABLE_ROWS = ROWS_PER_PAGE * TABLE_PAGES;
 
 
 typedef struct Statement{
     StatementType type;
     Row row;
-    size_t size;
+    size_t size; // TODO: get rid of
 } Statement;
 
 typedef struct Table{
-    u32 pages_filled;
-    Arena* pages[TABLE_PAGES_MAX];
+    u32 num_rows;
+    Arena* pages[TABLE_PAGES];
 } Table;
 
+typedef struct Cursor{
+    Table* table;
+    u32 row_num;
+    bool end_of_table;
+} Cursor;
+
+static Cursor*
+cursor_at_start(Table* table){
+    Cursor* c = push_struct(tm, Cursor);
+    c->table = table;
+    c->row_num = 0;
+    c->end_of_table = (table->num_rows == 0);
+    return(c);
+}
+
+static Cursor*
+cursor_at_end(Table* table){
+    Cursor* c = push_struct(tm, Cursor);
+    c->table = table;
+    c->row_num = table->num_rows;
+    c->end_of_table = true;
+    return(c);
+}
+
 static void
-init_table(Table* table){
-    for(u32 i=0; i < TABLE_PAGES_MAX; ++i){
-        table->pages[i] = os_allocate_arena(PAGE_SIZE);
+cursor_next(Cursor* c){
+    c->row_num += 1;
+    if(c->row_num >= c->table->num_rows){
+        c->end_of_table = true;
     }
-    table->pages_filled = 0;
+}
+
+static void
+table_init(Table* table){
+    for(u32 i=0; i < TABLE_PAGES; ++i){
+        table->pages[i] = os_alloc_arena(PAGE_SIZE);
+    }
+    table->num_rows = 0;
 }
 
 static MetaCommand
@@ -89,7 +118,7 @@ do_meta_command(String8 input){
 }
 
 static PrepareResult
-prepare_insert(Arena* arena, String8 input, Statement* statement){
+prepare_insert(String8 input, Statement* statement){
     statement->type = StatementType_insert;
 
     char* keyword = strtok((char*)input.str, " ");
@@ -103,36 +132,30 @@ prepare_insert(Arena* arena, String8 input, Statement* statement){
 
     // TODO: Need to check to see if we are larger than the page size here
     u64 username_length = str_length(username);
+    if(username_length > USERNAME_SIZE){
+        return(PrepareResult_username_too_long);
+    }
     u64 email_length = str_length(email);
-    statement->row.id = atoi(id_string); // NOTE: strtol is more flexible. consider using it later
-    if(statement->row.id < 0){
+    if(email_length > EMAIL_SIZE){
+        return(PrepareResult_email_too_long);
+    }
+    s32 id = atoi(id_string); // NOTE: strtol is more flexible. consider using it later
+    if(id < 0){
         return(PrepareResult_negative_id);
     }
 
-    // NOTE: + 1 on push_array() to account for 0 terminator
-    u8* username_alloc = push_array(arena, u8, username_length + 1);
-    u8* email_alloc = push_array(arena, u8, email_length + 1);
-    statement->row.username = {username_alloc, username_length};
-    statement->row.email = {email_alloc, email_length};
-    u8* username_null_char = statement->row.username.str + username_length;
-    u8* email_null_char = statement->row.email.str + email_length;
-    *username_null_char = 9;
-    *email_null_char = 9;
-
-    memcpy(statement->row.username.str, username, username_length);
-    memcpy(statement->row.email.str, email, email_length);
-
-    size_t unaligned_size = sizeof(Row) + username_length + email_length + 2;
-    statement->size = AlignUpPow2(unaligned_size, sizeof(Row));
+    statement->row.id = id;
+    strcpy(statement->row.username, username);
+    strcpy(statement->row.email, email);
 
     return(PrepareResult_success);
 }
 
 static PrepareResult
-prepare_statement(Arena* arena, String8 input, Statement* statement){
+prepare_statement(String8 input, Statement* statement){
     PrepareResult result = ZERO_INIT;
     if(str8_starts_with(input, str8_literal("insert"))){
-        result = prepare_insert(arena, input, statement);
+        result = prepare_insert(input, statement);
         return(result);
     }
 
@@ -145,65 +168,74 @@ prepare_statement(Arena* arena, String8 input, Statement* statement){
 }
 
 static Arena*
-get_next_page(Table* table, Statement* statement){
-    Arena* page = table->pages[table->pages_filled];
+get_next_page(Table* table){
+    u32 num_rows = table->num_rows;
+    u32 page_num = num_rows / ROWS_PER_PAGE;
 
-    if(page->used + statement->size > page->size){
-        table->pages_filled++;
-        page = table->pages[table->pages_filled];
-    }
-    return(page);
-}
-
-static Row* serialize_row(Arena* page, Row row_data){
-    Row* result = push_struct(page, Row);
-    result->id = row_data.id;
-
-    // NOTE: + 1 on push_array to account for 0 terminator
-    u8* username = push_array(page, u8, row_data.username.size + 1);
-    u8* email = push_array(page, u8, row_data.email.size + 1);
-    result->username = {username, row_data.username.size};
-    result->email = {email, row_data.email.size};
-
-    memcpy(result->username.str, row_data.username.str, row_data.username.size);
-    memcpy(result->email.str, row_data.email.str, row_data.email.size);
-
-    // NOTE: align on size of Row
-    page->used = AlignUpPow2(page->used, sizeof(Row));
-    result->arena_used = page->used;
-
+    Arena* result = table->pages[page_num];
     return(result);
 }
 
-static void deserialize_row(Arena* page){
-    void* at = page->base;
-    void* end = (u8*)page->base + page->used;
+static Row*
+cursor_at(Cursor* c){
+    u32 row_num = c->row_num;
+    u32 page_num = row_num / ROWS_PER_PAGE;
+    u32 row_offset = row_num % ROWS_PER_PAGE;
 
-    Row* row;
-    while(at != end){
-        row = (Row*)at;
-        print("(%d, %s, %s)\n", row->id, row->username.str, row->email.str);
-        at = (u8*)page->base + row->arena_used;
-    }
+    Arena* page = c->table->pages[page_num];
+    Row* row = (Row*)((u8*)page->base + (row_offset * ROW_SIZE));
+    return(row);
+}
+
+static void
+serialize_row(Arena* page, Row row_data){
+    Row* result = push_struct(page, Row);
+    result->id = row_data.id;
+    strcpy(result->username, row_data.username);
+    strcpy(result->email, row_data.email);
+}
+
+//static void
+//deserialize_page(Arena* page){
+//    void* at = (u8*)page->base;
+//    void* end = (u8*)page->base + page->used;
+//
+//    Row* row;
+//    while(at != end){
+//        row = (Row*)at;
+//        print("(%d, %s, %s)\n", row->id, row->username, row->email);
+//        at = (u8*)at + ROW_SIZE;
+//    }
+//}
+
+static void
+deserialize_row(Row* row){
+    print("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
 
 static ExecuteResult
 execute_insert(Table* table, Statement* statement){
-    if(table->pages_filled >= TABLE_PAGES_MAX){
+    u32 pages_filled = table->num_rows / ROWS_PER_PAGE;
+    if(pages_filled >= TABLE_PAGES){
         return(ExecuteResult_table_full);
     }
 
-    Arena* page = get_next_page(table, statement);
-    Row* row = serialize_row(page, statement->row);
-    print("page num: %d - page used: %d - page size: %d\n", table->pages_filled, page->used, page->size);
+    Arena* page = get_next_page(table);
+    serialize_row(page, statement->row);
+    table->num_rows++;
+    print("page num: %d - page used: %d - page size: %d\n", pages_filled, page->used, page->size);
     return(ExecuteResult_success);
 }
 
 static ExecuteResult
 execute_select(Table* table, Statement* statement){
-    for(u32 i=0; i <= table->pages_filled; ++i){
-        Arena* page = table->pages[i];
-        deserialize_row(page);
+    Cursor* cursor = cursor_at_start(table);
+
+    Row* at;
+    while(!(cursor->end_of_table)){
+        at = cursor_at(cursor);
+        deserialize_row(at);
+        cursor_next(cursor);
     }
     return(ExecuteResult_success);
 }
@@ -230,43 +262,46 @@ str8_strip_newline(String8* str){
 }
 
 static void
-db_close(Arena* arena, String8 dir, String8 file_name, Table* table){
+db_close(Table* table){
+    u32 pages_filled = table->num_rows / ROWS_PER_PAGE;
     u64 offset = 0;
-    for(u32 i=0; i <= table->pages_filled; ++i){
+    FileData num_rows = {&table->num_rows, sizeof(u32)};
+	os_file_write(num_rows, dir, filename, 0);
+    offset += sizeof(u32);
+    for(u32 i=0; i <= pages_filled; ++i){
         Arena* page = table->pages[i];
         FileData data = {page->base, page->used};
-        os_file_write(data, dir, file_name, offset);
+        os_file_write(data, dir, filename, offset);
         offset += page->size;
     }
 }
 
-s32 main(s32 argc, char** argv){
-    Arena* pm = allocate_arena(MB(4));
-    Arena* tm = allocate_arena(MB(1));
-    Table table;
-    init_table(&table);
+static void
+db_open(Arena* arena, Table* table){
+    FileData file = os_file_read(arena, dir, filename);
+    if(file.size){
+		table->num_rows = *(u32*)file.base;
+		u32 pages_filled = table->num_rows / ROWS_PER_PAGE;
+		u32 row_offset = table->num_rows % ROWS_PER_PAGE;
+		void* at = (u8*)file.base + sizeof(u32);
+        for(u32 i=0; i <= pages_filled; ++i){
+            Arena* page = table->pages[i];
+            page->base = (u8*)at + (i * PAGE_SIZE);
 
-    String8 dir = os_get_cwd(pm);
-    String8 file_name = str8_literal("\\data\\mydb.db");
-    FileData file = os_file_read(pm, dir, file_name);
-    table.pages_filled = file.size / PAGE_SIZE;
-
-    for(u32 i=0; i <= table.pages_filled; ++i){
-        Arena* page = table.pages[i];
-        page->base = (u8*)file.base + (i * PAGE_SIZE);
+            if(i == pages_filled){
+                page->used = row_offset * ROW_SIZE;
+            }
+            else{
+                page->used = ROWS_PER_PAGE * ROW_SIZE;
+            }
+        }
     }
+}
 
-    //void* at = (u8*)file.base;
-    //void* end = (u8*)file.base + file.size;
-    //Row* row;
-    //while(at != end){
-    //    row = (Row*)at;
-    //    at = (u8*)file.base + row->arena_used;
-    //}
-    //u32 num_pages = file.size / PAGE_SIZE;
-
-    //u32 page_number_at = file.size / PAGE_SIZE;
-    //u32 page_number_at = file.size / PAGE_SIZE;
+s32 main(s32 argc, char** argv){
+    Table table;
+    table_init(&table);
+    db_open(pm, &table);
 
     bool running = true;
     while(running){
@@ -279,7 +314,7 @@ s32 main(s32 argc, char** argv){
             switch(command){
                 case MetaCommand_exit:{
                     print("quiting");
-                    db_close(pm, dir, file_name, &table);
+                    db_close(&table);
                     running = false;
                     exit(EXIT_SUCCESS);
                 } continue;
@@ -292,7 +327,7 @@ s32 main(s32 argc, char** argv){
         }
 
         Statement statement;
-        PrepareResult prepare_result = prepare_statement(tm, input, &statement);
+        PrepareResult prepare_result = prepare_statement(input, &statement);
         switch(prepare_result){
             case PrepareResult_success:{
             } break;
@@ -301,6 +336,12 @@ s32 main(s32 argc, char** argv){
             } continue;
             case PrepareResult_negative_id:{
                 print("ID must be positive.\n");
+            } continue;
+            case PrepareResult_username_too_long:{
+                print("Username string is too long. Max: %d\n", USERNAME_SIZE);
+            } continue;
+            case PrepareResult_email_too_long:{
+                print("Email string is too long. Max: %d\n", EMAIL_SIZE);
             } continue;
             case PrepareResult_unrecognized_statement:{
                 print("Unrecognized keyword: '%.*s'\n", (s32)input.size, input.str);
