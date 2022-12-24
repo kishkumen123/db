@@ -52,7 +52,7 @@ typedef struct Row{
 global u32 ROW_SIZE = sizeof(Row);
 global u32 PAGE_SIZE = KB(1);
 global u32 ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
-global u32 const TABLE_PAGES = 100;
+global u32 const TABLE_PAGES = 3;
 global u32 TABLE_ROWS = ROWS_PER_PAGE * TABLE_PAGES;
 
 
@@ -91,6 +91,17 @@ cursor_at_end(Table* table){
     return(c);
 }
 
+static Row*
+cursor_at(Cursor* c){
+    u32 row_num = c->row_num;
+    u32 num_pages = row_num / ROWS_PER_PAGE;
+    u32 row_offset = row_num % ROWS_PER_PAGE;
+
+    Arena* page = c->table->pages[num_pages];
+    Row* row = (Row*)((u8*)page->base + (row_offset * ROW_SIZE));
+    return(row);
+}
+
 static void
 cursor_next(Cursor* c){
     c->row_num += 1;
@@ -102,7 +113,7 @@ cursor_next(Cursor* c){
 static void
 table_init(Table* table){
     for(u32 i=0; i < TABLE_PAGES; ++i){
-        table->pages[i] = os_alloc_arena(PAGE_SIZE);
+        table->pages[i] = 0;
     }
     table->num_rows = 0;
 }
@@ -168,23 +179,15 @@ prepare_statement(String8 input, Statement* statement){
 }
 
 static Arena*
-get_next_page(Table* table){
-    u32 num_rows = table->num_rows;
-    u32 page_num = num_rows / ROWS_PER_PAGE;
+get_page(Table* table){
+    u32 num_pages = table->num_rows / ROWS_PER_PAGE;
 
-    Arena* result = table->pages[page_num];
+    Arena* result = table->pages[num_pages];
+    if(result == 0){
+        result = os_alloc_arena(PAGE_SIZE);
+        table->pages[num_pages] = result;
+    }
     return(result);
-}
-
-static Row*
-cursor_at(Cursor* c){
-    u32 row_num = c->row_num;
-    u32 page_num = row_num / ROWS_PER_PAGE;
-    u32 row_offset = row_num % ROWS_PER_PAGE;
-
-    Arena* page = c->table->pages[page_num];
-    Row* row = (Row*)((u8*)page->base + (row_offset * ROW_SIZE));
-    return(row);
 }
 
 static void
@@ -215,15 +218,15 @@ deserialize_row(Row* row){
 
 static ExecuteResult
 execute_insert(Table* table, Statement* statement){
-    u32 pages_filled = table->num_rows / ROWS_PER_PAGE;
-    if(pages_filled >= TABLE_PAGES){
+    u32 num_pages = table->num_rows / ROWS_PER_PAGE;
+    if(num_pages >= TABLE_PAGES){
         return(ExecuteResult_table_full);
     }
 
-    Arena* page = get_next_page(table);
+    Arena* page = get_page(table);
     serialize_row(page, statement->row);
     table->num_rows++;
-    print("page num: %d - page used: %d - page size: %d\n", pages_filled, page->used, page->size);
+    print("page num: %d - page used: %d - page size: %d\n", num_pages, page->used, page->size);
     return(ExecuteResult_success);
 }
 
@@ -263,16 +266,17 @@ str8_strip_newline(String8* str){
 
 static void
 db_close(Table* table){
-    u32 pages_filled = table->num_rows / ROWS_PER_PAGE;
+    u32 num_pages = table->num_rows / ROWS_PER_PAGE;
+    u32 row_offset = table->num_rows % ROWS_PER_PAGE;
     u64 offset = 0;
-    FileData num_rows = {&table->num_rows, sizeof(u32)};
-	os_file_write(num_rows, dir, filename, 0);
-    offset += sizeof(u32);
-    for(u32 i=0; i <= pages_filled; ++i){
+    for(u32 i=0; i <= num_pages; ++i){
+        if(i == num_pages && row_offset == 0){
+            continue;
+        }
         Arena* page = table->pages[i];
         FileData data = {page->base, page->used};
         os_file_write(data, dir, filename, offset);
-        offset += page->size;
+        offset += page->used;
     }
 }
 
@@ -280,20 +284,20 @@ static void
 db_open(Arena* arena, Table* table){
     FileData file = os_file_read(arena, dir, filename);
     if(file.size){
-		table->num_rows = *(u32*)file.base;
-		u32 pages_filled = table->num_rows / ROWS_PER_PAGE;
+		table->num_rows = file.size / ROW_SIZE;
+		u32 num_pages = table->num_rows / ROWS_PER_PAGE;
 		u32 row_offset = table->num_rows % ROWS_PER_PAGE;
-		void* at = (u8*)file.base + sizeof(u32);
-        for(u32 i=0; i <= pages_filled; ++i){
+        u32 max_row_offset = ROWS_PER_PAGE * ROW_SIZE;
+        for(u32 i=0; i <= num_pages; ++i){
             Arena* page = table->pages[i];
-            page->base = (u8*)at + (i * PAGE_SIZE);
 
-            if(i == pages_filled){
-                page->used = row_offset * ROW_SIZE;
-            }
-            else{
-                page->used = ROWS_PER_PAGE * ROW_SIZE;
-            }
+            page = os_alloc_arena(PAGE_SIZE);
+            page->base = (u8*)file.base + (i * max_row_offset);
+            page->used = i == num_pages ? (row_offset * ROW_SIZE) : max_row_offset;
+            //if(i == num_pages){
+            //    page->used = row_offset * ROW_SIZE;
+            //}
+            table->pages[i] = page;
         }
     }
 }
