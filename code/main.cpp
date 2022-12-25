@@ -293,12 +293,10 @@ db_open(Arena* arena, Table* table){
 
             page = os_alloc_arena(PAGE_SIZE);
             page->base = (u8*)file.base + (i * max_row_offset);
-            page->used = i == num_pages ? (row_offset * ROW_SIZE) : max_row_offset;
-            //if(i == num_pages){
-            //    page->used = row_offset * ROW_SIZE;
-            //}
+            page->used = max_row_offset;
             table->pages[i] = page;
         }
+        table->pages[num_pages]->used = row_offset * ROW_SIZE;
     }
 }
 
