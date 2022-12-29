@@ -9,6 +9,7 @@ global String8 dir = os_get_cwd(pm);
 global String8 filename = str8_literal("\\data\\mydb.db");
 global bool running = true;
 
+global u32 const ID_SIZE = sizeof(s32);
 global u32 const USERNAME_SIZE = 32;
 global u32 const EMAIL_SIZE = 255;
 typedef struct Row{
@@ -17,6 +18,9 @@ typedef struct Row{
     char email[EMAIL_SIZE];
 } Row;
 
+global u32 ID_OFFSET = 0;
+global u32 USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
+global u32 EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
 global u32 ROW_SIZE = sizeof(Row);
 global u32 PAGE_SIZE = KB(1);
 global u32 ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
@@ -27,7 +31,7 @@ global u32 TABLE_ROWS = ROWS_PER_PAGE * TABLE_PAGES;
 // NOTE: Here we are defining the layout of our data (format).
 //          [(type)(is_root)(parent_pointer)][(num_cells)][(key)(value)(key)(value)(key)(value)]
 //                          ^                      ^                         ^
-//                 common header layout     leef header layout         key value pairs
+//                 common header layout     leaf header layout         key value pairs
 // NOTE: Common Node Header Layout. This is the layout that is common to all nodes, which contains the (type, is_root, parent_pointer).
 global u32 NODE_TYPE_SIZE = sizeof(u8);
 global u32 NODE_TYPE_OFFSET = 0;
@@ -50,6 +54,11 @@ global u32 LEAF_NODE_VALUE_OFFSET = LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;
 global u32 LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
 global u32 LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
 global u32 LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
+
+typedef enum NodeType{
+    NodeType_internal,
+    NodeType_leaf
+} NodeType;
 
 static u32*
 leaf_node_num_cells(void* node){
@@ -75,16 +84,23 @@ leaf_node_value(void* node, u32 cell_num){
     return(result);
 }
 
-// NOTE: set num cells of the node to be 0.
-static void
-init_leaf_node(void* node){
-    *leaf_node_num_cells(node) = 0;
+static NodeType
+get_node_type(void* node){
+    u8 result = *((u8*)node + NODE_TYPE_OFFSET);
+    return((NodeType)result);
 }
 
-typedef enum NodeType{
-    NodeType_internal,
-    NodeType_leef
-} NodeType;
+static void
+set_node_type(void* node, NodeType type){
+    u8 type_u8 = type;
+    *((u8*)node + NODE_TYPE_OFFSET) = type_u8;
+}
+
+static void
+init_leaf_node(void* node){
+    set_node_type(node, NodeType_leaf);
+    *leaf_node_num_cells(node) = 0;
+}
 
 typedef struct BTree{
     u8 type;
@@ -120,6 +136,7 @@ typedef enum StatementType{
 typedef enum ExecuteResult{
     ExecuteResult_success,
     ExecuteResult_table_full,
+    ExecuteResult_duplicate_key,
 } ExecuteResult;
 
 typedef struct Statement{
@@ -188,6 +205,51 @@ cursor_end(Table* table){
     return(c);
 }
 
+static Cursor*
+leaf_node_find(Table* table, u32 page_num, u32 key){
+    Arena* node = get_page(table, page_num);
+    u32 num_cells = *leaf_node_num_cells(node->base);
+
+    Cursor* c = push_struct(tm, Cursor);
+    c->table = table;
+    c->page_num = page_num;
+
+    // NOTE: binary search
+    u32 min_index = 0;
+    u32 opl_index = num_cells;
+    while(min_index != opl_index){
+        u32 index = (min_index + opl_index) / 2;
+        u32 key_at_index = *leaf_node_key(node->base, index);
+        if(key == key_at_index){
+            c->cell_num = index;
+            return(c);
+        }
+        if(key < key_at_index){
+            opl_index = index;
+        }
+        else{
+            min_index = index + 1;
+        }
+    }
+
+    c->cell_num = min_index;
+    return(c);
+}
+
+static Cursor*
+cursor_find(Table* table, u32 key){
+    u32 root_page_num = table->root_page_num;
+    Arena* root_node = get_page(table, root_page_num);
+
+    if((get_node_type(root_node->base) == NodeType_leaf)){
+        return leaf_node_find(table, root_page_num, key);
+    }
+    else{
+        print("Need to implement searching an internal node.\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
 static Row*
 cursor_at(Cursor* c){
     //u32 row_num = c->row_num;
@@ -209,14 +271,10 @@ cursor_next(Cursor* c){
     if(c->cell_num >= (*leaf_node_num_cells(page->base))){
         c->end_of_table = true;
     }
-    //c->row_num += 1;
-    //if(c->row_num >= c->table->num_rows){
-        //c->end_of_table = true;
-    //}
 }
 
 static void
-table_init(Table* table){
+init_table(Table* table){
     table->num_pages = 0;
     table->root_page_num = 0;
     for(u32 i=0; i < TABLE_PAGES; ++i){
@@ -275,7 +333,7 @@ db_open(Arena* arena, Table* table){
         // NOTE: new database. init page 0 as leaf node.
         //Arena* page = get_page(table, 0);
         Arena* page = os_alloc_arena(PAGE_SIZE);
-        void* shift = push_array(page, u8, LEAF_NODE_HEADER_SIZE);
+        //void* shift = push_array(page, u8, LEAF_NODE_HEADER_SIZE);
         init_leaf_node(page->base);
         table->pages[0] = page;
     } else{
@@ -283,13 +341,12 @@ db_open(Arena* arena, Table* table){
 		//u32 num_pages = table->num_rows / ROWS_PER_PAGE;
 		//u32 row_offset = table->num_rows % ROWS_PER_PAGE;
 
-        u32 max_row_offset = ROWS_PER_PAGE * ROW_SIZE;
         for(u32 i=0; i <= num_pages; ++i){
             Arena* page = table->pages[i];
 
             page = os_alloc_arena(PAGE_SIZE);
             page->base = (u8*)file.base + (i * PAGE_SIZE);
-            page->used = max_row_offset;
+            page->used = ROWS_PER_PAGE * ROW_SIZE;
             table->pages[i] = page;
         }
         //table->pages[num_pages]->used = row_offset * ROW_SIZE;
@@ -370,12 +427,15 @@ prepare_statement(String8 input, Statement* statement){
 }
 
 static void
-serialize_row(Arena* page, Row* row){
+serialize_row(void* dest, Row* row){
     //Row* result = push_struct(page, Row);
-    Row* result = (Row*)push_array(page, u8, ROW_SIZE);
-    result->id = row->id;
-    strcpy(result->username, row->username);
-    strcpy(result->email, row->email);
+    memcpy((u8*)dest + ID_OFFSET, &row->id, ID_SIZE);
+    memcpy((u8*)dest + USERNAME_OFFSET, row->username, USERNAME_SIZE);
+    memcpy((u8*)dest + EMAIL_OFFSET, row->email, EMAIL_SIZE);
+    //Row* result = (Row*)push_array(page, u8, ROW_SIZE);
+    //result->id = row->id;
+    //strcpy(result->username, row->username);
+    //strcpy(result->email, row->email);
 }
 
 //static void
@@ -412,35 +472,34 @@ leaf_node_insert(Cursor* c, u32 key, Row* row){
     }
 
     *(leaf_node_num_cells(page->base)) += 1;
-    void* shift = push_array(page, u8, 4);
+    //void* shift = push_array(page, u8, 4);
     *(leaf_node_key(page->base, c->cell_num)) = key;
-    serialize_row(page, row);
+    //serialize_row(page, row);
+    serialize_row(leaf_node_value(page->base, c->cell_num), row);
 }
 
 static ExecuteResult
 execute_insert(Table* table, Statement* statement){
-    u32 num_pages = table->num_pages;
+    //u32 num_pages = table->num_pages;
     Arena* node = get_page(table, table->root_page_num);
-    if((*leaf_node_num_cells(node->base) >= LEAF_NODE_MAX_CELLS)){
+    u32 num_cells = *leaf_node_num_cells(node->base);
+    if(num_cells >= LEAF_NODE_MAX_CELLS){
         return(ExecuteResult_table_full);
     }
 
     Row* row = &statement->row;
-    Cursor* c = cursor_end(table);
-    leaf_node_insert(c, row->id, row);
+    s32 id = row->id;
+    Cursor* c = cursor_find(table, id);
 
-
-    //u32 num_pages = table->num_rows / ROWS_PER_PAGE;
-    //if(num_pages >= TABLE_PAGES){
-    //    return(ExecuteResult_table_full);
-    //}
-
-
-
-    //Arena* page = get_page(table, 0);
-    //serialize_row(page, &statement->row);
-    //table->num_rows++;
-    print("page num: %d - page used: %d - page size: %d\n", num_pages, node->used, node->size);
+    if(c->cell_num < num_cells){
+        u32 current_id = *leaf_node_key(node->base, c->cell_num);
+        if(id == current_id){
+            return(ExecuteResult_duplicate_key);
+        }
+    }
+    leaf_node_insert(c, id, row);
+    //print("page num: %d - page used: %d - page size: %d\n", num_pages, node->used, node->size);
+    print("page num: %d - page used: %d - page size: %d\n", table->num_pages, node->used, node->size);
     return(ExecuteResult_success);
 }
 
@@ -479,8 +538,8 @@ str8_strip_newline(String8* str){
 }
 
 s32 main(s32 argc, char** argv){
-    os_file_delete(dir, filename);
-    table_init(&table);
+    //os_file_delete(dir, filename);
+    init_table(&table);
     db_open(pm, &table);
 
     while(running){
@@ -525,6 +584,9 @@ s32 main(s32 argc, char** argv){
         switch(execute_result){
             case ExecuteResult_success:{
                 print("Executed.\n");
+            } break;
+            case ExecuteResult_duplicate_key:{
+                print("Error: Duplicate key.\n");
             } break;
             case ExecuteResult_table_full:{
                 print("Error: Table full.\n");
