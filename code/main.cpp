@@ -44,7 +44,15 @@ global u8  COMMON_NODE_HEADER_SIZE = NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POIN
 // NOTE: Leaf Node Header Layout. This contains the layout of the leaf node, that proceeds the Common Node Header Layout. This will store just the number of cells the node contains.
 global u32 LEAF_NODE_NUM_CELLS_SIZE = sizeof(u32);
 global u32 LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
-global u32 LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE;
+global u32 LEAF_NODE_NEXT_LEAF_SIZE = sizeof(u32);
+global u32 LEAF_NODE_NEXT_LEAF_OFFSET = LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE;
+//global u32 LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE;
+global u32 LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE + LEAF_NODE_NEXT_LEAF_SIZE;
+
+//const uint32_t LEAF_NODE_NEXT_LEAF_SIZE = sizeof(uint32_t);
+//const uint32_t LEAF_NODE_NEXT_LEAF_OFFSET = LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE;
+//const uint32_t LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE + LEAF_NODE_NEXT_LEAF_SIZE;
+
 
 // NOTE: Leaf Node Body Layout. This is describing the data layout of our cells (key/value pair).
 global u32 LEAF_NODE_KEY_SIZE = sizeof(u32);
@@ -69,6 +77,7 @@ global u32 INTERNAL_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE + INTERNAL_NODE_N
 global u32 INTERNAL_NODE_KEY_SIZE = sizeof(u32);
 global u32 INTERNAL_NODE_CHILD_SIZE = sizeof(u32);
 global u32 INTERNAL_NODE_CELL_SIZE = INTERNAL_NODE_KEY_SIZE + INTERNAL_NODE_CHILD_SIZE;
+
 
 typedef enum NodeType{
     NodeType_internal,
@@ -100,17 +109,17 @@ is_node_root(void* node){
 
 static u32*
 internal_node_num_keys(void* node){
-    return (u32*)((u8*)node + INTERNAL_NODE_NUM_KEYS_OFFSET);
+    return((u32*)((u8*)node + INTERNAL_NODE_NUM_KEYS_OFFSET));
 }
 
 static u32*
 internal_node_right_child(void* node){
-    return (u32*)((u8*)node + INTERNAL_NODE_RIGHT_CHILD_OFFSET);
+    return((u32*)((u8*)node + INTERNAL_NODE_RIGHT_CHILD_OFFSET));
 }
 
 static u32*
 internal_node_cell(void* node, u32 cell_num){
-    return (u32*)((u8*)node + INTERNAL_NODE_HEADER_SIZE + (cell_num * INTERNAL_NODE_CELL_SIZE));
+    return((u32*)((u8*)node + INTERNAL_NODE_HEADER_SIZE + (cell_num * INTERNAL_NODE_CELL_SIZE)));
 }
 
 static u32*
@@ -121,16 +130,16 @@ internal_node_child(void* node, u32 child_num){
         exit(EXIT_FAILURE);
     }
     else if(child_num == num_keys){
-        return internal_node_right_child(node);
+        return(internal_node_right_child(node));
     }
     else{
-        return internal_node_cell(node, child_num);
+        return(internal_node_cell(node, child_num));
     }
 }
 
 static u32*
 internal_node_key(void* node, u32 key_num){
-    return internal_node_cell(node, key_num) + INTERNAL_NODE_CHILD_SIZE;
+    return(internal_node_cell(node, key_num) + INTERNAL_NODE_CHILD_SIZE);
 }
 
 static void
@@ -138,6 +147,11 @@ init_internal_node(void* node){
     set_node_type(node, NodeType_internal);
     set_node_root(node, false);
     *internal_node_num_keys(node) = 0;
+}
+
+static u32*
+leaf_node_next_leaf(void* node){
+    return((u32*)((u8*)node + LEAF_NODE_NEXT_LEAF_OFFSET));
 }
 
 static u32*
@@ -168,9 +182,9 @@ static u32
 get_node_max_key(void* node){
     switch(get_node_type(node)){
         case NodeType_internal:
-            return *internal_node_key(node, *internal_node_num_keys(node) - 1);
+            return(*internal_node_key(node, *internal_node_num_keys(node) - 1));
         case NodeType_leaf:
-            return *leaf_node_key(node, *leaf_node_num_cells(node) - 1);
+            return(*leaf_node_key(node, *leaf_node_num_cells(node) - 1));
     }
 }
 
@@ -179,6 +193,7 @@ init_leaf_node(void* node){
     set_node_type(node, NodeType_leaf);
     set_node_root(node, false);
     *leaf_node_num_cells(node) = 0;
+    *leaf_node_next_leaf(node) = 0;
 }
 
 typedef struct BTree{
@@ -259,18 +274,18 @@ typedef struct Cursor{
     bool end_of_table;
 } Cursor;
 
-static Cursor*
-cursor_start(Table* table){
-    Cursor* c = push_struct(tm, Cursor);
-    c->table = table;
-    c->page_num = table->root_page_num;
-    c->cell_num = 0;
-
-    Arena* root_node = get_page(table, table->root_page_num);
-    u32 num_cells = *leaf_node_num_cells(root_node->base);
-    c->end_of_table = (num_cells == 0);
-    return(c);
-}
+//static Cursor*
+//cursor_start(Table* table){
+//    Cursor* c = push_struct(tm, Cursor);
+//    c->table = table;
+//    c->page_num = table->root_page_num;
+//    c->cell_num = 0;
+//
+//    Arena* root_node = get_page(table, table->root_page_num);
+//    u32 num_cells = *leaf_node_num_cells(root_node->base);
+//    c->end_of_table = (num_cells == 0);
+//    return(c);
+//}
 
 static Cursor*
 cursor_end(Table* table){
@@ -350,7 +365,7 @@ cursor_find(Table* table, u32 key){
     Arena* root_node = get_page(table, root_page_num);
 
     if((get_node_type(root_node->base) == NodeType_leaf)){
-        return leaf_node_find(table, root_page_num, key);
+        return(leaf_node_find(table, root_page_num, key));
     }
     else{
         //print("Need to implement searching an internal node.\n");
@@ -359,19 +374,44 @@ cursor_find(Table* table, u32 key){
     }
 }
 
+static Cursor*
+cursor_start(Table* table){
+    Cursor* c = cursor_find(table, 0);
+    //c->table = table;
+    //c->page_num = table->root_page_num;
+    //c->cell_num = 0;
+
+    void* node = get_page(table, c->page_num)->base;
+    u32 num_cells = *leaf_node_num_cells(node);
+    c->end_of_table = (num_cells == 0);
+    return(c);
+}
+
 static Row*
 cursor_at(Cursor* c){
-    Arena* page = get_page(c->table, c->page_num);
-    Row* row = (Row*)leaf_node_value(page->base, c->cell_num);
+    void* node = get_page(c->table, c->page_num)->base;
+    Row* row = (Row*)leaf_node_value(node, c->cell_num);
     return(row);
 }
 
 static void
 cursor_next(Cursor* c){
-    Arena* page = get_page(c->table, c->page_num);
+    void* node = get_page(c->table, c->page_num)->base;
+
     c->cell_num += 1;
-    if(c->cell_num >= (*leaf_node_num_cells(page->base))){
-        c->end_of_table = true;
+    u32 num_cells = *leaf_node_num_cells(node);
+    if(c->cell_num >= num_cells){
+        //c->end_of_table = true;
+        // NOTE: Advance to next leaf node
+        u32 next_page_num = *leaf_node_next_leaf(node);
+        if(next_page_num == 0){
+            // NOTE: This was right most leaf
+            c->end_of_table = true;
+        }
+        else{
+            c->page_num = next_page_num;
+            c->cell_num = 0;
+        }
     }
 }
 
@@ -480,7 +520,7 @@ db_open(Arena* arena, Table* table){
         set_node_root(page->base, true);
         table->pages[0] = page;
     } else{
-        for(u32 i=0; i <= num_pages; ++i){
+        for(u32 i=0; i < num_pages; ++i){
             Arena* page = table->pages[i];
 
             page = os_alloc_arena(PAGE_SIZE);
@@ -617,6 +657,8 @@ leaf_node_split_and_insert(Cursor* c, u32 key, Row* row){
     u32 new_page_num = get_unused_page_num(c->table);
     void* new_node = get_page(c->table, new_page_num)->base;
     init_leaf_node(new_node);
+    *leaf_node_next_leaf(new_node) = *leaf_node_next_leaf(old_node);
+    *leaf_node_next_leaf(old_node) = new_page_num;
 
     // NOTE: All existing keys plus new key should be divided evenly between old(left) and new(right) nodes.
     // Starting from the right, move each key to the correct position.
@@ -660,8 +702,8 @@ leaf_node_split_and_insert(Cursor* c, u32 key, Row* row){
 
 static void
 leaf_node_insert(Cursor* c, u32 key, Row* row){
-    Arena* page = get_page(c->table, c->page_num);
-    u32 num_cells = *leaf_node_num_cells(page->base);
+    void* node = get_page(c->table, c->page_num)->base;
+    u32 num_cells = *leaf_node_num_cells(node);
     if(num_cells >= LEAF_NODE_MAX_CELLS){
         leaf_node_split_and_insert(c, key, row);
         return;
@@ -671,13 +713,13 @@ leaf_node_insert(Cursor* c, u32 key, Row* row){
 
     if(c->cell_num < num_cells){
         for(s32 i=num_cells; i > c->cell_num; --i){
-            memcpy(leaf_node_cell(page->base, i), leaf_node_cell(page->base, i - 1), LEAF_NODE_CELL_SIZE);
+            memcpy(leaf_node_cell(node, i), leaf_node_cell(node, i - 1), LEAF_NODE_CELL_SIZE);
         }
     }
 
-    *(leaf_node_num_cells(page->base)) += 1;
-    *(leaf_node_key(page->base, c->cell_num)) = key;
-    serialize_row(leaf_node_value(page->base, c->cell_num), row);
+    *(leaf_node_num_cells(node)) += 1;
+    *(leaf_node_key(node, c->cell_num)) = key;
+    serialize_row(leaf_node_value(node, c->cell_num), row);
 }
 
 static ExecuteResult
