@@ -22,9 +22,10 @@ global u32 ID_OFFSET = 0;
 global u32 USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
 global u32 EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
 global u32 ROW_SIZE = sizeof(Row);
-global u32 PAGE_SIZE = KB(4);
-global u32 ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
+global u32 PAGE_SIZE = 900;
+global u32 INTERNAL_NODE_MAX_CELLS = 3;
 global u32 const TABLE_PAGES = 100;
+global u32 ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
 global u32 TABLE_ROWS = ROWS_PER_PAGE * TABLE_PAGES;
 
 
@@ -84,6 +85,11 @@ typedef enum NodeType{
     NodeType_leaf
 } NodeType;
 
+static u32*
+node_parent(void* node){
+    return((u32*)((u8*)node + PARENT_POINTER_OFFSET));
+}
+
 static NodeType
 get_node_type(void* node){
     u8 result = *((u8*)node + NODE_TYPE_OFFSET);
@@ -139,7 +145,7 @@ internal_node_child(void* node, u32 child_num){
 
 static u32*
 internal_node_key(void* node, u32 key_num){
-    return(internal_node_cell(node, key_num) + INTERNAL_NODE_CHILD_SIZE);
+    return((u32*)(((u8*)((void*)internal_node_cell(node, key_num))) + INTERNAL_NODE_CHILD_SIZE));
 }
 
 static void
@@ -330,12 +336,12 @@ leaf_node_find(Table* table, u32 page_num, u32 key){
     return(c);
 }
 
-static Cursor*
-internal_node_find(Table* table, u32 page_num, u32 key){
-    void* node = get_page(table, page_num)->base;
+static u32
+internal_node_find_child(void* node, u32 key){
+    // NOTE: Return the index of the child which should contain the given key.
     u32 num_keys = *internal_node_num_keys(node);
 
-    // NOTE: Binary search to find index of child to search
+    // NOTE: Binary search
     u32 min_index = 0;
     u32 max_index = num_keys;
     while(min_index != max_index){
@@ -348,8 +354,22 @@ internal_node_find(Table* table, u32 page_num, u32 key){
             min_index = index + 1;
         }
     }
+    return(min_index);
+}
 
-    u32 child_num = *internal_node_child(node, min_index);
+static void
+update_internal_node_key(void* node, u32 old_key, u32 new_key){
+    u32 old_child_index = internal_node_find_child(node, old_key);
+    *internal_node_key(node, old_child_index) = new_key;
+}
+
+static Cursor*
+internal_node_find(Table* table, u32 page_num, u32 key){
+    void* node = get_page(table, page_num)->base;
+    u32 num_keys = *internal_node_num_keys(node);
+
+    u32 child_index = internal_node_find_child(node, key);
+    u32 child_num = *internal_node_child(node, child_index);
     void* child = get_page(table, child_num)->base;
     switch(get_node_type(child)){
         case NodeType_leaf:
@@ -623,6 +643,43 @@ get_unused_page_num(Table* table){
 }
 
 static void
+internal_node_insert(Table* table, u32 parent_page_num, u32 child_page_num){
+    // NOTE: Add a new child/key pair to parent that corresponds to child
+
+    void* parent = get_page(table, parent_page_num);
+    void* child = get_page(table, child_page_num);
+    u32 child_max_key = get_node_max_key(child);
+    u32 index = internal_node_find_child(parent, child_max_key);
+
+    u32 original_num_keys = *internal_node_num_keys(parent);
+    *internal_node_num_keys(parent) = original_num_keys + 1;
+
+    if(original_num_keys >= INTERNAL_NODE_MAX_CELLS){
+        print("Need to implement splitting internal node\n");
+        exit(EXIT_FAILURE);
+    }
+
+    u32 right_child_page_num = *internal_node_right_child(parent);
+    void* right_child = get_page(table, right_child_page_num);
+
+    if(child_max_key > get_node_max_key(right_child)){
+        // NOTE: Replace right child
+        *internal_node_child(parent, original_num_keys) = right_child_page_num;
+        *internal_node_key(parent, original_num_keys) = get_node_max_key(right_child);
+        *internal_node_right_child(parent) = child_page_num;
+    }
+    else{
+        for(u32 i=original_num_keys; i > index; --i){
+            void* dest = internal_node_cell(parent, i);
+            void* source = internal_node_cell(parent, i - 1);
+            memcpy(dest, source, INTERNAL_NODE_CELL_SIZE);
+        }
+    }
+    *internal_node_child(parent, index) = child_page_num;
+    *internal_node_key(parent, index) = child_max_key;
+}
+
+static void
 create_new_root(Table* table, u32 right_child_page_num){
     // NOTE: Handle splitting the root.
     // Old root copied to new page, becomes left child.
@@ -646,6 +703,8 @@ create_new_root(Table* table, u32 right_child_page_num){
     u32 left_child_max_key = get_node_max_key(left_child);
     *internal_node_key(root, 0) = left_child_max_key;
     *internal_node_right_child(root) = right_child_page_num;
+    *node_parent(left_child) = table->root_page_num;
+    *node_parent(right_child) = table->root_page_num;
 }
 
 static void
@@ -654,9 +713,11 @@ leaf_node_split_and_insert(Cursor* c, u32 key, Row* row){
     // Insert the value in one of the two noes.
     // Update parent or create a new parent.
     void* old_node = get_page(c->table, c->page_num)->base;
+    u32 old_max = get_node_max_key(old_node);
     u32 new_page_num = get_unused_page_num(c->table);
     void* new_node = get_page(c->table, new_page_num)->base;
     init_leaf_node(new_node);
+    *node_parent(new_node) = *node_parent(old_node);
     *leaf_node_next_leaf(new_node) = *leaf_node_next_leaf(old_node);
     *leaf_node_next_leaf(old_node) = new_page_num;
 
@@ -695,8 +756,15 @@ leaf_node_split_and_insert(Cursor* c, u32 key, Row* row){
         return(create_new_root(c->table, new_page_num));
     }
     else{
-        print("Need to implement updating parent after split\n");
-        exit(EXIT_FAILURE);
+        //print("Need to implement updating parent after split\n");
+        //exit(EXIT_FAILURE);
+        u32 parent_page_num = *node_parent(old_node);
+        u32 new_max = get_node_max_key(old_node);
+        void* parent = get_page(c->table, parent_page_num)->base;
+
+        update_internal_node_key(parent, old_max, new_max);
+        internal_node_insert(c->table, parent_page_num, new_page_num);
+        return;
     }
 }
 
